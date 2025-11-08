@@ -746,11 +746,13 @@ void llm_graph_result::reset() {
 
     inputs.clear();
 
-    buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+    size_t mem_size = ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false);
+    buf_compute_meta.resize(mem_size + GGML_MEM_ALIGN);
+    void *mem_buffer = (void*)GGML_PAD((uintptr_t)buf_compute_meta.data(), GGML_MEM_ALIGN);
 
     ggml_init_params params = {
-        /*.mem_size   =*/ buf_compute_meta.size(),
-        /*.mem_buffer =*/ buf_compute_meta.data(),
+        /*.mem_size   =*/ mem_size,
+        /*.mem_buffer =*/ mem_buffer,
         /*.no_alloc   =*/ true,
     };
 

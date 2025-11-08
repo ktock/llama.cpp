@@ -1675,7 +1675,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_prev_graph_size = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
-    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+    sched->context_buffer = (char *) ggml_aligned_malloc(sched->context_buffer_size);
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));

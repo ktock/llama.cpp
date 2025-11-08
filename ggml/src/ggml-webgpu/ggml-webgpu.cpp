@@ -3271,8 +3271,27 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
+#include <emscripten.h>
+EM_ASYNC_JS(int, check_webgpu_available, (), {
+    if (!('gpu' in navigator)) {
+        return 0;
+    }
+    const a = await navigator.gpu.requestAdapter();
+    console.log(a);
+    if (a == null) {
+        return 0;
+    }
+    return 1;
+})
+
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
+
+    if (!check_webgpu_available()) {
+        // Unregister this to avoid panic during runtime
+        WEBGPU_LOG_DEBUG("WebGPU is not available\n");
+        return nullptr;
+    }
 
     static ggml_backend_webgpu_reg_context ctx;
     ctx.name         = GGML_WEBGPU_NAME;

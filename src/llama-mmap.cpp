@@ -244,15 +244,21 @@ struct llama_file::impl {
         }
         errno = 0;
         if (fd == -1) {
-            const size_t curr_off = tell();
-            const size_t to_read = std::min(len, size - curr_off);
-
-            std::size_t ret = std::fread(ptr, to_read, 1, fp);
-            if (ferror(fp)) {
-                throw std::runtime_error(format("read error: %s", strerror(errno)));
-            }
-            if (to_read > 0 && ret != 1) {
-                throw std::runtime_error("unexpectedly reached end of file");
+            uintptr_t ptrptr = (uintptr_t)ptr;
+            size_t nr = 0;
+            while (nr < len) {
+                errno = 0;
+                int ret = fread((void*)(ptrptr + nr), 1, len - nr, fp);
+                if (ret <= 0) {
+                    if (errno == EAGAIN) {
+                        continue;
+                    }
+                    if (ret == 0) {
+                        throw std::runtime_error("unexpectedly reached end of file");
+                    }
+                    throw std::runtime_error(format("read error: %s", strerror(errno)));
+                }
+                nr += ret;
             }
         } else {
             size_t bytes_read = 0;
@@ -261,7 +267,7 @@ struct llama_file::impl {
                 ssize_t ret = ::read(fd, reinterpret_cast<char *>(ptr) + bytes_read, to_read);
 
                 if (ret == -1) {
-                    if (errno == EINTR) {
+                  if ((errno == EINTR) || (errno == EAGAIN)) {
                         continue;  // Interrupted by signal, retry
                     }
                     // Fallback to std::fread in case the DMA controller cannot access the buffer

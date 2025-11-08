@@ -43,7 +43,7 @@
 #elif defined(_AIX)
 #include <sys/limits.h>
 #else
-#include <sys/syslimits.h>
+// #include <sys/syslimits.h>
 #endif
 #endif
 
