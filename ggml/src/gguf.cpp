@@ -223,7 +223,19 @@ struct gguf_reader {
 
     template <typename T>
     bool read(T & dst) const {
-        return fread(&dst, 1, sizeof(dst), file) == sizeof(dst);
+        size_t nr = 0;
+        uintptr_t dstptr = (uintptr_t)&dst;
+        while (nr < sizeof(dst)) {
+            int ret = fread((void*)(dstptr + nr), 1, sizeof(dst) - nr, file);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                return false;
+            }
+            nr += ret;
+        }
+        return nr == sizeof(dst);
     }
 
     template <typename T>
@@ -278,11 +290,38 @@ struct gguf_reader {
             return false;
         }
         dst.resize(size);
-        return fread(dst.data(), 1, dst.length(), file) == dst.length();
+
+        size_t nr = 0;
+        uintptr_t dstptr = (uintptr_t)(dst.data());
+        while (nr < dst.length()) {
+            int ret = fread((void*)(dstptr + nr), 1, dst.length() - nr, file);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                return false;
+            }
+            nr += ret;
+        }
+
+        return nr == dst.length();
     }
 
     bool read(void * dst, const size_t size) const {
-        return fread(dst, 1, size, file) == size;
+        size_t nr = 0;
+        uintptr_t dstptr = (uintptr_t)dst;
+        while (nr < size) {
+            int ret = fread((void*)(dstptr + nr), 1, size - nr, file);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                return false;
+            }
+            nr += ret;
+        }
+
+        return nr == size;
     }
 };
 

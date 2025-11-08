@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+typedef unsigned int uint;
+
 #ifdef GGML_WEBGPU_DEBUG
 #    define WEBGPU_LOG_DEBUG(msg)  std::cout << msg << std::endl
 #    define WEBGPU_DEBUG_BUF_ELEMS 32
@@ -2117,14 +2119,15 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
     GGML_ASSERT(ctx->adapter != nullptr);
 
     ctx->adapter.GetLimits(&ctx->limits);
-    ctx->max_wg_size_x = 288;  // default value
+    ctx->max_wg_size_x = 256;  // default value
 
     wgpu::AdapterInfo info{};
     ctx->adapter.GetInfo(&info);
 
     // Initialize device
-    std::vector<wgpu::FeatureName> required_features = { wgpu::FeatureName::ShaderF16,
-                                                         wgpu::FeatureName::ImplicitDeviceSynchronization };
+    std::vector<wgpu::FeatureName> required_features = { wgpu::FeatureName::ShaderF16 };
+    // std::vector<wgpu::FeatureName> required_features = { wgpu::FeatureName::ShaderF16,
+    //                                                      wgpu::FeatureName::ImplicitDeviceSynchronization };
 #ifdef GGML_WEBGPU_GPU_PROFILE
     required_features.push_back(wgpu::FeatureName::TimestampQuery);
 #endif
@@ -2233,8 +2236,27 @@ static const struct ggml_backend_reg_i ggml_backend_webgpu_reg_i = {
 
 /* End GGML Backend Registration Interface */
 
+#include <emscripten.h>
+EM_ASYNC_JS(int, check_webgpu_available, (), {
+    if (!('gpu' in navigator)) {
+        return 0;
+    }
+    const a = await navigator.gpu.requestAdapter();
+    console.log(a);
+    if (a == null) {
+        return 0;
+    }
+    return 1;
+})
+
 ggml_backend_reg_t ggml_backend_webgpu_reg() {
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_reg()");
+
+    if (!check_webgpu_available()) {
+        // Unregister this to avoid panic during runtime
+        WEBGPU_LOG_DEBUG("WebGPU is not available\n");
+        return nullptr;
+    }
 
     webgpu_context webgpu_ctx = std::make_shared<webgpu_context_struct>();
 

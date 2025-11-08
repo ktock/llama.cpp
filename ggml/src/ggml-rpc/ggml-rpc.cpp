@@ -37,9 +37,63 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
 
+extern "C" {
+    int send_peer(int, const void*, int);
+    int recv_peer(int, void*, int);
+    int connect_peer(void*, int);
+    int accept_peer(void);
+    void close_peer(int);
+
+    int cache_get(void*, int, void*, int, int);
+    void cache_put(void*, int, void*, int);
+}
+
+#include <emscripten.h>
+
+static int send_peer_retry(int fd, const void* data, int len) {
+    int total = 0;
+    int remain = len;
+    while (true) {
+        int c = send_peer(fd, data, remain);
+        if (c < 0) {
+            return c;
+        }
+        total += c;
+        if (total == len) {
+            break;
+        }
+        remain -= c;
+        data = &(((const char*)data)[c]);
+        emscripten_sleep(0);
+    }
+    return total;
+}
+
+static int recv_peer_retry(int fd, void* data, int len) {
+    if ((data == NULL) || (len == 0)) {
+        return 0;
+    }
+    int total = 0;
+    int remain = len;
+    while (true) {
+        int c = recv_peer(fd, data, remain);
+        if (c < 0) {
+            return c;
+        }
+        total += c;
+        if (total == len) {
+            break;
+        }
+        remain -= c;
+        data = &(((char*)data)[c]);
+        emscripten_sleep(0);
+    }
+    return total;
+}
+
 namespace fs = std::filesystem;
 
-static constexpr size_t MAX_CHUNK_SIZE = 1024ull * 1024ull * 1024ull; // 1 GiB
+static constexpr size_t MAX_CHUNK_SIZE = 100ull * 1024ull * 1024ull; // 100 MiB
 
 #ifdef _WIN32
 typedef SOCKET sockfd_t;
@@ -57,7 +111,7 @@ struct socket_t {
 #ifdef _WIN32
         closesocket(this->fd);
 #else
-        close(this->fd);
+        close_peer(this->fd);
 #endif
     }
 };
@@ -112,7 +166,7 @@ enum rpc_cmd {
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
-const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+const size_t HASH_THRESHOLD = 1 * 1024 * 1024;
 
 struct rpc_msg_hello_rsp {
     uint8_t major;
@@ -184,6 +238,7 @@ struct rpc_msg_set_tensor_hash_req {
     rpc_tensor tensor;
     uint64_t offset;
     uint64_t hash;
+    uint64_t size;
 };
 
 struct rpc_msg_set_tensor_hash_rsp {
@@ -260,103 +315,11 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len) {
     return hash;
 }
 
-static std::shared_ptr<socket_t> make_socket(sockfd_t fd) {
-#ifdef _WIN32
-    if (fd == INVALID_SOCKET) {
-        return nullptr;
-    }
-#else
-    if (fd < 0) {
-        return nullptr;
-    }
-#endif
-    return std::make_shared<socket_t>(fd);
-}
-
-static bool set_no_delay(sockfd_t sockfd) {
-    int flag = 1;
-    // set TCP_NODELAY to disable Nagle's algorithm
-    int ret = setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
-    return ret == 0;
-}
-
-static bool set_reuse_addr(sockfd_t sockfd) {
-    int flag = 1;
-    int ret = setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof(int));
-    return ret == 0;
-}
-
-static std::shared_ptr<socket_t> socket_connect(const char * host, int port) {
-    struct sockaddr_in addr;
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    auto sock_ptr = make_socket(sockfd);
-    if (sock_ptr == nullptr) {
-        return nullptr;
-    }
-    if (!set_no_delay(sockfd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
-        GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
-        return nullptr;
-    }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (connect(sock_ptr->fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        return nullptr;
-    }
-    return sock_ptr;
-}
-
-static std::shared_ptr<socket_t> socket_accept(sockfd_t srv_sockfd) {
-    auto client_socket_fd = accept(srv_sockfd, NULL, NULL);
-    auto client_socket = make_socket(client_socket_fd);
-    if (client_socket == nullptr) {
-        return nullptr;
-    }
-    if (!set_no_delay(client_socket_fd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    return client_socket;
-}
-
-static std::shared_ptr<socket_t> create_server_socket(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    auto sock = make_socket(sockfd);
-    if (sock == nullptr) {
-        return nullptr;
-    }
-    if (!set_reuse_addr(sockfd)) {
-        GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
-        return nullptr;
-    }
-    if (inet_addr(host) == INADDR_NONE) {
-        GGML_LOG_ERROR("Invalid host address: %s\n", host);
-        return nullptr;
-    }
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port = htons(port);
-
-    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        return nullptr;
-    }
-    if (listen(sockfd, 1) < 0) {
-        return nullptr;
-    }
-    return sock;
-}
-
 static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
     size_t bytes_sent = 0;
     while (bytes_sent < size) {
         size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
-        ssize_t n = send(sockfd, (const char *)data + bytes_sent, size_to_send, 0);
+        ssize_t n = send_peer_retry(sockfd, (const char *)data + bytes_sent, size_to_send);
         if (n < 0) {
             GGML_LOG_ERROR("send failed (bytes_sent=%zu, size_to_send=%zu)\n",
                            bytes_sent, size_to_send);
@@ -371,10 +334,10 @@ static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         size_t size_to_recv = std::min(size - bytes_recv, MAX_CHUNK_SIZE);
-        ssize_t n = recv(sockfd, (char *)data + bytes_recv, size_to_recv, 0);
+        ssize_t n = recv_peer_retry(sockfd, (char *)data + bytes_recv, size_to_recv);
         if (n < 0) {
-            GGML_LOG_ERROR("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
-                           bytes_recv, size_to_recv);
+            LOG_DBG("recv failed (bytes_recv=%zu, size_to_recv=%zu)\n",
+                    bytes_recv, size_to_recv);
             return false;
         }
         if (n == 0) {
@@ -416,16 +379,6 @@ static bool recv_msg(sockfd_t sockfd, std::vector<uint8_t> & input) {
         return false;
     }
     return recv_data(sockfd, input.data(), size);
-}
-
-static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
-    size_t pos = endpoint.find(':');
-    if (pos == std::string::npos) {
-        return false;
-    }
-    host = endpoint.substr(0, pos);
-    port = std::stoi(endpoint.substr(pos + 1));
-    return true;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -485,7 +438,6 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-    static bool initialized = false;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
@@ -493,27 +445,13 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
             return sock;
         }
     }
-    std::string host;
-    int port;
-    if (!parse_endpoint(endpoint, host, port)) {
+
+    int fd = connect_peer((void*)endpoint.c_str(), endpoint.size());
+    if (fd < 0) {
         return nullptr;
     }
-#ifdef _WIN32
-    if (!initialized) {
-        WSADATA wsaData;
-        int res = WSAStartup(MAKEWORD(2, 2), &wsaData);
-        if (res != 0) {
-            return nullptr;
-        }
-        initialized = true;
-    }
-#else
-    GGML_UNUSED(initialized);
-#endif
-    auto sock = socket_connect(host.c_str(), port);
-    if (sock == nullptr) {
-        return nullptr;
-    }
+
+    auto sock = std::make_shared<socket_t>(fd);
     if (!check_server_version(sock)) {
         return nullptr;
     }
@@ -602,6 +540,7 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
+        request.size = size;
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
@@ -611,13 +550,29 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
             return;
         }
     }
-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
-    std::vector<uint8_t> input(input_size, 0);
-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    // input serialization format: | rpc_tensor | offset (8 bytes) | hash (8 bytes) | data (size bytes)
+    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t) + size;
+
+    uint8_t cmd_byte = RPC_CMD_SET_TENSOR;
+    bool status;
+
+    status = send_data(ctx->sock->fd, &cmd_byte, sizeof(cmd_byte));
+    RPC_STATUS_ASSERT(status);
+
+    status = send_data(ctx->sock->fd, &input_size, sizeof(input_size));
+    RPC_STATUS_ASSERT(status);
+
+    status = send_data(ctx->sock->fd, &rpc_tensor, sizeof(rpc_tensor));
+    RPC_STATUS_ASSERT(status);
+
+    status = send_data(ctx->sock->fd, &offset, sizeof(offset));
+    RPC_STATUS_ASSERT(status);
+
+    uint64_t hash = fnv_hash((const uint8_t*)data, size);
+    status = send_data(ctx->sock->fd, &hash, sizeof(hash));
+    RPC_STATUS_ASSERT(status);
+
+    status = send_data(ctx->sock->fd, data, size);
     RPC_STATUS_ASSERT(status);
 }
 
@@ -932,7 +887,7 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
+    bool set_tensor(sockfd_t sockfd);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
@@ -940,6 +895,7 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    void request_count();
 
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -953,6 +909,7 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+    int requests;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1120,15 +1077,33 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
-    // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
-    if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
+bool rpc_server::set_tensor(sockfd_t sockfd) {
+    uint64_t inputsize;
+    if (!recv_data(sockfd, &inputsize, sizeof(inputsize))) {
         return false;
     }
-    const rpc_tensor * in_tensor = (const rpc_tensor *)input.data();
+
+    // serialization format: | rpc_tensor | offset (8 bytes) | hash (8 bytes) | data (size bytes) |
+    if (inputsize < sizeof(rpc_tensor) + sizeof(uint64_t) + sizeof(uint64_t)) {
+        return false;
+    }
+
+    rpc_tensor in_tensor;
+    if (!recv_data(sockfd, &in_tensor, sizeof(in_tensor))) {
+        return false;
+    }
+
     uint64_t offset;
-    memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
-    const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
+    if (!recv_data(sockfd, &offset, sizeof(offset))) {
+        return false;
+    }
+
+    uint64_t hash;
+    if (!recv_data(sockfd, &hash, sizeof(hash))) {
+        return false;
+    }
+
+    const size_t size = inputsize - sizeof(rpc_tensor) - sizeof(offset) - sizeof(hash);
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1138,7 +1113,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     ggml_context_ptr ctx_ptr { ggml_init(params) };
     GGML_ASSERT(ctx_ptr != nullptr);
     ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    ggml_tensor * tensor = deserialize_tensor(ctx, &in_tensor);
     if (tensor == nullptr || tensor->buffer == nullptr) {
         GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
         return false;
@@ -1150,25 +1125,39 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
 
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
+        if (in_tensor.data + offset < p0 || in_tensor.data + offset >= p1 || size > (p1 - in_tensor.data - offset)) {
             GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
+                           __func__, in_tensor.data, offset, size, p0, p1);
             return false;
         }
     }
 
-    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
-    if (cache_dir && size > HASH_THRESHOLD) {
-        uint64_t hash = fnv_hash((const uint8_t*)data, size);
-        char hash_str[17];
-        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64, hash);
-        // save to cache_dir/hash_str
-        fs::path cache_file = fs::path(cache_dir) / hash_str;
-        std::ofstream ofs(cache_file, std::ios::binary);
-        ofs.write((const char *)data, size);
-        GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.c_str());
+    std::vector<uint8_t> input;
+    size_t nr = 0;
+    uint64_t idx = 0;
+    while (nr < size) {
+        size_t size_to_recv = std::min(size - nr, MAX_CHUNK_SIZE);
+        try {
+            input.resize(size_to_recv);
+        } catch (const std::bad_alloc & e) {
+            GGML_LOG_ERROR("Failed to allocate tensor buffer of size %zu\n", size);
+            return false;
+        }
+        if (!recv_data(sockfd, input.data(), size_to_recv)) {
+            return false;
+        }
+        ggml_backend_tensor_set(tensor, input.data(), offset + nr, size_to_recv);
+
+        if (size > HASH_THRESHOLD) {
+            char hash_str[34];
+            snprintf(hash_str, sizeof(hash_str), "%016" PRIx64 ":%016" PRIx64, hash, idx);
+            cache_put(hash_str, sizeof(hash_str) - 1, input.data(), size_to_recv);
+        }
+
+        idx++;
+        nr += size_to_recv;
     }
-    ggml_backend_tensor_set(tensor, data, offset, size);
+
     return true;
 }
 
@@ -1193,12 +1182,7 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
-    std::vector<uint8_t> cached_file;
-    if (!get_cached_file(request.hash, cached_file)) {
-        response.result = 0;
-        return true;
-    }
-    size_t size = cached_file.size();
+    size_t size = request.size;
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1228,7 +1212,31 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
             return false;
         }
     }
-    ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    std::vector<uint8_t> input;
+    uint64_t idx = 0;
+    size_t nr = 0;
+    while (nr < size) {
+        size_t size_to_recv = std::min(size - nr, MAX_CHUNK_SIZE);
+        try {
+            input.resize(size_to_recv);
+        } catch (const std::bad_alloc & e) {
+            GGML_LOG_ERROR("Failed to allocate tensor buffer of size %zu\n", size);
+            return false;
+        }
+
+        char hash_str[34];
+        snprintf(hash_str, sizeof(hash_str), "%016" PRIx64 ":%016" PRIx64, request.hash, idx);
+        int reslen = cache_get(hash_str, sizeof(hash_str) - 1, input.data(), 0, size_to_recv);
+        if ((size_t)reslen != size_to_recv) {
+            response.result = 0;
+            return true;
+        }
+
+        ggml_backend_tensor_set(tensor, input.data(), request.offset + nr, size_to_recv);
+        
+        nr += size_to_recv;
+        idx++;
+    }
     response.result = 1;
     return true;
 }
@@ -1473,6 +1481,14 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+void rpc_server::request_count() {
+    requests++;
+    if (requests > 100) {
+        printf("Handling requests\n");
+        requests = 0;
+    }
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
@@ -1508,6 +1524,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        server.request_count();
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
@@ -1621,11 +1638,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
-                std::vector<uint8_t> input;
-                if (!recv_msg(sockfd, input)) {
-                    return;
-                }
-                if (!server.set_tensor(input)) {
+                if (!server.set_tensor(sockfd)) {
                     return;
                 }
                 break;
@@ -1756,11 +1769,6 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 
-    std::string host;
-    int port;
-    if (!parse_endpoint(endpoint, host, port)) {
-        return;
-    }
 #ifdef _WIN32
     {
         WSADATA wsaData;
@@ -1771,20 +1779,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         }
     }
 #endif
-    auto server_socket = create_server_socket(host.c_str(), port);
-    if (server_socket == nullptr) {
-        fprintf(stderr, "Failed to create server socket\n");
-        return;
-    }
     while (true) {
-        auto client_socket = socket_accept(server_socket->fd);
-        if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            return;
-        }
+        int fd = accept_peer();
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket->fd);
+        rpc_serve_client(backends, cache_dir, fd);
         printf("Client connection closed\n");
         fflush(stdout);
     }

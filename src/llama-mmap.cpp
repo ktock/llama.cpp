@@ -199,13 +199,21 @@ struct llama_file::impl {
         if (len == 0) {
             return;
         }
-        errno = 0;
-        std::size_t ret = std::fread(ptr, len, 1, fp);
-        if (ferror(fp)) {
-            throw std::runtime_error(format("read error: %s", strerror(errno)));
-        }
-        if (ret != 1) {
-            throw std::runtime_error("unexpectedly reached end of file");
+        uintptr_t ptrptr = (uintptr_t)ptr;
+        size_t nr = 0;
+        while (nr < len) {
+            errno = 0;
+            int ret = fread((void*)(ptrptr + nr), 1, len - nr, fp);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                if (ret == 0) {
+                    throw std::runtime_error("unexpectedly reached end of file");
+                }
+                throw std::runtime_error(format("read error: %s", strerror(errno)));
+            }
+            nr += ret;
         }
     }
 

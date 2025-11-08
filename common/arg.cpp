@@ -48,7 +48,7 @@
 #elif defined(_AIX)
 #include <sys/limits.h>
 #else
-#include <sys/syslimits.h>
+// #include <sys/syslimits.h>
 #endif
 #define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
 
