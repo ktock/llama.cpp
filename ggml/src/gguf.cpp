@@ -260,9 +260,20 @@ struct gguf_reader {
         if (nbytes_remain < size) {
             return false;
         }
-        const size_t nread = fread(&dst, 1, size, file);
-        nbytes_remain -= nread;
-        return nread == size;
+        size_t nr = 0;
+        uintptr_t dstptr = (uintptr_t)&dst;
+        while (nr < sizeof(dst)) {
+            int ret = fread((void*)(dstptr + nr), 1, sizeof(dst) - nr, file);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                return false;
+            }
+            nr += ret;
+        }
+        nbytes_remain -= nr;
+        return nr == sizeof(dst);
     }
 
     template <typename T>
@@ -344,18 +355,42 @@ struct gguf_reader {
             return false;
         }
         dst.resize(static_cast<size_t>(size));
-        const size_t nread = fread(dst.data(), 1, size, file);
-        nbytes_remain -= nread;
-        return nread == size;
+
+        size_t nr = 0;
+        uintptr_t dstptr = (uintptr_t)(dst.data());
+        while (nr < dst.length()) {
+            int ret = fread((void*)(dstptr + nr), 1, dst.length() - nr, file);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                return false;
+            }
+            nr += ret;
+        }
+        nbytes_remain -= nr;
+
+        return nr == size;
     }
 
     bool read(void * dst, const size_t size) const {
         if (size > nbytes_remain) {
             return false;
         }
-        const size_t nread = fread(dst, 1, size, file);
-        nbytes_remain -= nread;
-        return nread == size;
+        size_t nr = 0;
+        uintptr_t dstptr = (uintptr_t)dst;
+        while (nr < size) {
+            int ret = fread((void*)(dstptr + nr), 1, size - nr, file);
+            if (ret <= 0) {
+                if (errno == EAGAIN) {
+                    continue;
+                }
+                return false;
+            }
+            nr += ret;
+        }
+        nbytes_remain -= nr;
+        return nr == size;
     }
 
 private:
