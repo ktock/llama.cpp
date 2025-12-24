@@ -660,9 +660,10 @@ static bool ggml_is_view_op(enum ggml_op op) {
 
 // scheduler
 
-#ifndef GGML_SCHED_MAX_BACKENDS
-#define GGML_SCHED_MAX_BACKENDS 16
-#endif
+#define GGML_SCHED_MAX_BACKENDS 128
+// #ifndef GGML_SCHED_MAX_BACKENDS
+// #define GGML_SCHED_MAX_BACKENDS 16
+// #endif
 
 #ifndef GGML_SCHED_MAX_SPLIT_INPUTS
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
