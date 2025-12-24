@@ -64,6 +64,7 @@ if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
 
     option(GGML_WASM_SINGLE_FILE "ggml: embed WASM inside the generated ggml.js" ON)
+    set(CMAKE_SYSTEM_PROCESSOR wasm)
 else()
     if (MINGW)
         set(BUILD_SHARED_LIBS_DEFAULT OFF)
